@@ -4,10 +4,14 @@ import lodash from "lodash"
 import puppeteer from "puppeteer"
 import timers from "node:timers/promises"
 import fs from "node:fs/promises"
+import path from "node:path"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 // 暂时保留对原config的兼容
 import cfg from "../../../lib/config/config.js"
 
 const _path = process.cwd()
+const execFileAsync = promisify(execFile)
 // mac地址
 let mac = ""
 
@@ -51,8 +55,9 @@ export default class Puppeteer extends Renderer {
 
   /**
    * 初始化chromium
+   * @param retryCount userDataDir 被占用时的自动恢复重试次数
    */
-  async browserInit() {
+  async browserInit(retryCount = 0) {
     if (this.browser) return this.browser
     if (this.lock) return false
     this.lock = true
@@ -83,6 +88,8 @@ export default class Puppeteer extends Renderer {
       }
     } catch {}
 
+    let needRetry = false
+
     if (!this.browser || !connectFlag) {
       // 如果没有实例，初始化puppeteer
       this.browser = await puppeteer.launch(this.config).catch(async (err, trace) => {
@@ -94,12 +101,38 @@ export default class Puppeteer extends Renderer {
           )
         } else if (errMsg.includes("cannot open shared object file")) {
           logger.error("没有正确安装 Chromium 运行库")
-        } else if (errMsg.includes(this.config.userDataDir)) {
-          await fs.rm(this.config.userDataDir, { force: true, recursive: true }).catch(() => {})
-          return (this.lock = false)
+        } else {
+          const userDataDir = path.resolve(process.cwd(), this.config.userDataDir)
+          const normalizePath = value => String(value).replaceAll("\\", "/").toLowerCase()
+          const normalizedErrMsg = normalizePath(errMsg)
+          const normalizedUserDataDir = normalizePath(userDataDir)
+          const normalizedConfigUserDataDir = normalizePath(this.config.userDataDir)
+
+          if (
+            normalizedErrMsg.includes(normalizedUserDataDir) ||
+            normalizedErrMsg.includes(normalizedConfigUserDataDir)
+          ) {
+            logger.warn(`[puppeteer] 检测到 userDataDir 被占用: ${userDataDir}`)
+
+            if (retryCount >= 1) {
+              logger.error("[puppeteer] 自动恢复后仍然被占用，停止继续重试，避免死循环")
+              return false
+            }
+
+            const recovered = await this.recoverUserDataDir(userDataDir)
+            if (recovered) needRetry = true
+          }
         }
+        return false
       })
-      if (this.lock === false) return this.browserInit()
+
+      if (needRetry) {
+        this.browser = false
+        this.lock = false
+        logger.warn("[puppeteer] 残留 Chromium 已处理，准备自动重试一次")
+        await timers.setTimeout(500)
+        return this.browserInit(retryCount + 1)
+      }
     }
 
     this.lock = false
@@ -120,6 +153,130 @@ export default class Puppeteer extends Renderer {
     this.browser.on("disconnected", () => this.restart(true))
 
     return this.browser
+  }
+
+  /** Windows 下精确查找使用当前 userDataDir 的 Chromium 进程 */
+  async findWindowsChromiumPids(userDataDir, strictExecutable = true) {
+    if (process.platform !== "win32") return []
+
+    const executablePath = this.config.executablePath
+      ? path.resolve(process.cwd(), this.config.executablePath)
+      : ""
+
+    const psScript = String.raw`
+$profile = [IO.Path]::GetFullPath($env:MIAO_PUPPETEER_USER_DATA_DIR)
+$profileNorm = $profile.Replace([char]47, [char]92).TrimEnd([char]92).ToLowerInvariant()
+$exeNorm = ''
+if (-not [string]::IsNullOrWhiteSpace($env:MIAO_PUPPETEER_EXECUTABLE)) {
+  $exeNorm = ([IO.Path]::GetFullPath($env:MIAO_PUPPETEER_EXECUTABLE)).Replace([char]47, [char]92).ToLowerInvariant()
+}
+$strictExe = $env:MIAO_PUPPETEER_STRICT_EXE -eq '1'
+
+Get-CimInstance Win32_Process | Where-Object {
+  if ([string]::IsNullOrWhiteSpace($_.CommandLine)) { return $false }
+
+  $cmdNorm = $_.CommandLine.Replace([char]47, [char]92).ToLowerInvariant()
+  if (-not $cmdNorm.Contains($profileNorm)) { return $false }
+
+  if ($strictExe -and -not [string]::IsNullOrWhiteSpace($exeNorm)) {
+    if ([string]::IsNullOrWhiteSpace($_.ExecutablePath)) { return $false }
+    $procExeNorm = ([IO.Path]::GetFullPath($_.ExecutablePath)).Replace([char]47, [char]92).ToLowerInvariant()
+    if ($procExeNorm -ne $exeNorm) { return $false }
+  }
+
+  return $true
+} | Sort-Object ProcessId | ForEach-Object { $_.ProcessId }
+`
+
+    try {
+      const { stdout } = await execFileAsync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript],
+        {
+          windowsHide: true,
+          maxBuffer: 1024 * 1024,
+          env: {
+            ...process.env,
+            MIAO_PUPPETEER_USER_DATA_DIR: userDataDir,
+            MIAO_PUPPETEER_EXECUTABLE: executablePath,
+            MIAO_PUPPETEER_STRICT_EXE: strictExecutable ? "1" : "0",
+          },
+        },
+      )
+
+      return String(stdout)
+        .split(/\r?\n/)
+        .map(v => Number.parseInt(v.trim(), 10))
+        .filter(Number.isInteger)
+    } catch (err) {
+      logger.error(`[puppeteer] 查询残留 Chromium 进程失败: ${err}`)
+      return []
+    }
+  }
+
+  /** 强制结束一个 Windows 进程及其整个子进程树 */
+  async killWindowsProcessTree(pid) {
+    if (process.platform !== "win32" || !Number.isInteger(pid)) return false
+
+    try {
+      await execFileAsync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      })
+      logger.warn(`[puppeteer] 已强制结束 Chromium 进程树 PID=${pid}`)
+      return true
+    } catch (err) {
+      const msg = String(err?.stderr || err?.stdout || err?.message || err).trim()
+      logger.warn(`[puppeteer] 结束 PID=${pid} 时返回: ${msg}`)
+      return false
+    }
+  }
+
+  /** userDataDir 被旧 Chromium 占用时进行一次自动恢复 */
+  async recoverUserDataDir(userDataDir) {
+    try {
+      if (this.browserMacKey) await redis.del(this.browserMacKey).catch(() => {})
+
+      if (process.platform === "win32") {
+        let pids = await this.findWindowsChromiumPids(userDataDir, true)
+
+        if (pids.length === 0) {
+          logger.warn("[puppeteer] 未找到严格匹配 chromium_path 的进程，改为按 userDataDir 查找残留")
+          pids = await this.findWindowsChromiumPids(userDataDir, false)
+        }
+
+        if (pids.length > 0) {
+          logger.warn(`[puppeteer] 找到占用 userDataDir 的进程 PID: ${pids.join(", ")}`)
+          for (const pid of pids) await this.killWindowsProcessTree(pid)
+          await timers.setTimeout(800)
+        } else {
+          logger.warn("[puppeteer] 未查询到占用 userDataDir 的 Chromium 进程")
+        }
+      }
+
+      try {
+        await fs.rm(userDataDir, { force: true, recursive: true })
+      } catch (firstRemoveErr) {
+        if (process.platform !== "win32") throw firstRemoveErr
+
+        logger.warn(`[puppeteer] 第一次清理 userDataDir 仍失败: ${firstRemoveErr}`)
+        const remainingPids = await this.findWindowsChromiumPids(userDataDir, false)
+
+        if (remainingPids.length > 0) {
+          logger.warn(`[puppeteer] 发现剩余进程 PID: ${remainingPids.join(", ")}`)
+          for (const pid of remainingPids) await this.killWindowsProcessTree(pid)
+          await timers.setTimeout(800)
+        }
+
+        await fs.rm(userDataDir, { force: true, recursive: true })
+      }
+
+      logger.warn(`[puppeteer] 已清理 userDataDir: ${userDataDir}`)
+      return true
+    } catch (err) {
+      logger.error(`[puppeteer] 自动恢复失败: ${err}`)
+      return false
+    }
   }
 
   // 获取Mac地址
